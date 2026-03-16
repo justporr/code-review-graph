@@ -72,6 +72,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".kt": "kotlin",
     ".swift": "swift",
     ".php": "php",
+    ".dart": "dart",
 }
 
 # Tree-sitter node type mappings per language
@@ -94,6 +95,7 @@ _CLASS_TYPES: dict[str, list[str]] = {
     "kotlin": ["class_declaration", "object_declaration"],
     "swift": ["class_declaration", "struct_declaration", "protocol_declaration"],
     "php": ["class_declaration", "interface_declaration"],
+    "dart": ["class_definition", "mixin_declaration", "enum_declaration"],
 }
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
@@ -111,6 +113,7 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     "kotlin": ["function_declaration"],
     "swift": ["function_declaration"],
     "php": ["function_definition", "method_declaration"],
+    "dart": ["function_signature", "method_signature", "constructor_signature"],
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
@@ -128,6 +131,7 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "kotlin": ["import_header"],
     "swift": ["import_declaration"],
     "php": ["namespace_use_declaration"],
+    "dart": ["import_or_export"],
 }
 
 _CALL_TYPES: dict[str, list[str]] = {
@@ -164,6 +168,7 @@ _TEST_FILE_PATTERNS = [
     re.compile(r".*\.spec\.[jt]sx?$"),
     re.compile(r".*_test\.go$"),
     re.compile(r"tests?/"),
+    re.compile(r".*_test\.dart$"),
 ]
 
 
@@ -259,7 +264,12 @@ class CodeParser:
         import_types = set(_IMPORT_TYPES.get(language, []))
         call_types = set(_CALL_TYPES.get(language, []))
 
-        for child in root.children:
+        children_list = list(root.children)
+        _dart_skip: set[int] = set()
+
+        for i, child in enumerate(children_list):
+            if i in _dart_skip:
+                continue
             node_type = child.type
 
             # --- Classes ---
@@ -342,11 +352,30 @@ class CodeParser:
                         line=child.start_point[0] + 1,
                     ))
 
-                    # Recurse to find calls inside the function
-                    self._extract_from_tree(
-                        child, source, language, file_path, nodes, edges,
-                        enclosing_class=enclosing_class, enclosing_func=name,
-                    )
+                    if language == "dart":
+                        # Dart: signature and body are siblings. Don't recurse
+                        # into the signature (avoids duplicates from
+                        # method_signature -> function_signature). Process the
+                        # function_body sibling instead.
+                        if (i + 1 < len(children_list)
+                                and children_list[i + 1].type == "function_body"):
+                            body = children_list[i + 1]
+                            _dart_skip.add(i + 1)
+                            node.line_end = body.end_point[0] + 1
+                            self._extract_from_tree(
+                                body, source, language, file_path, nodes, edges,
+                                enclosing_class=enclosing_class,
+                                enclosing_func=name,
+                            )
+                            self._extract_dart_calls(
+                                body, source, file_path, edges, qualified,
+                            )
+                    else:
+                        # Recurse to find calls inside the function
+                        self._extract_from_tree(
+                            child, source, language, file_path, nodes, edges,
+                            enclosing_class=enclosing_class, enclosing_func=name,
+                        )
                     continue
 
             # --- Imports ---
@@ -389,6 +418,20 @@ class CodeParser:
 
     def _get_name(self, node, language: str, kind: str) -> Optional[str]:
         """Extract the name from a class/function definition node."""
+        # For Dart: function signatures have type_identifier (return type) before
+        # identifier (name), so we must only match 'identifier' for functions.
+        # For method_signature, recurse into the inner signature.
+        if language == "dart" and kind == "function":
+            for child in node.children:
+                if child.type == "identifier":
+                    return child.text.decode("utf-8", errors="replace")
+            # method_signature wraps getter/setter/function_signature
+            for child in node.children:
+                if child.type in (
+                    "function_signature", "getter_signature", "setter_signature",
+                ):
+                    return self._get_name(child, language, kind)
+            return None
         # For C/C++: function names are inside function_declarator/pointer_declarator
         # Check these first to avoid matching the return type_identifier
         if language in ("c", "cpp") and kind == "function":
@@ -414,8 +457,16 @@ class CodeParser:
     def _get_params(self, node, language: str, source: bytes) -> Optional[str]:
         """Extract parameter list as a string."""
         for child in node.children:
-            if child.type in ("parameters", "formal_parameters", "parameter_list"):
+            if child.type in (
+                "parameters", "formal_parameters", "parameter_list",
+                "formal_parameter_list",
+            ):
                 return child.text.decode("utf-8", errors="replace")
+        # Dart: params may be in inner signature (method_signature wraps function_signature)
+        if language == "dart":
+            for child in node.children:
+                if child.type in ("function_signature", "getter_signature", "setter_signature"):
+                    return self._get_params(child, language, source)
         return None
 
     def _get_return_type(self, node, language: str, source: bytes) -> Optional[str]:
@@ -474,6 +525,13 @@ class CodeParser:
                                     for f in field_node.children:
                                         if f.type == "type_identifier":
                                             bases.append(f.text.decode("utf-8", errors="replace"))
+        elif language == "dart":
+            # Dart: extends, implements, with (mixins) are children of class_definition
+            for child in node.children:
+                if child.type in ("superclass", "interfaces", "mixins"):
+                    for sub in child.children:
+                        if sub.type == "type_identifier":
+                            bases.append(sub.text.decode("utf-8", errors="replace"))
         return bases
 
     def _extract_import(self, node, language: str, source: bytes) -> list[str]:
@@ -532,6 +590,9 @@ class CodeParser:
                 match = re.search(r"""['"](.*?)['"]""", text)
                 if match:
                     imports.append(match.group(1))
+        elif language == "dart":
+            # import 'package:foo/bar.dart'; or import 'dart:async';
+            self._find_dart_string_literals(node, imports)
         else:
             # Fallback: just record the text
             imports.append(text)
@@ -567,5 +628,81 @@ class CodeParser:
         # Scoped call (e.g., Rust path::func())
         if first.type in ("scoped_identifier", "qualified_name"):
             return first.text.decode("utf-8", errors="replace")
+
+        return None
+
+    # --- Dart-specific helpers ---
+
+    def _find_dart_string_literals(self, node, imports: list[str]) -> None:
+        """Recursively find string literals in Dart import/export nodes."""
+        if node.type == "string_literal":
+            val = node.text.decode("utf-8", errors="replace").strip("'\"")
+            if val:
+                imports.append(val)
+            return
+        for child in node.children:
+            self._find_dart_string_literals(child, imports)
+
+    def _extract_dart_calls(
+        self,
+        node,
+        source: bytes,
+        file_path: str,
+        edges: list[EdgeInfo],
+        caller_qualified: str,
+    ) -> None:
+        """Extract function/method calls from Dart AST subtree."""
+        children = list(node.children)
+        for i, child in enumerate(children):
+            if child.type == "identifier" and i + 1 < len(children):
+                next_sib = children[i + 1]
+                if next_sib.type == "selector":
+                    call_name = self._detect_dart_call(children, i)
+                    if call_name:
+                        edges.append(EdgeInfo(
+                            kind="CALLS",
+                            source=caller_qualified,
+                            target=call_name,
+                            file_path=file_path,
+                            line=child.start_point[0] + 1,
+                        ))
+            self._extract_dart_calls(
+                child, source, file_path, edges, caller_qualified,
+            )
+
+    def _detect_dart_call(self, siblings: list, idx: int) -> Optional[str]:
+        """Detect a Dart call pattern starting at siblings[idx] (identifier).
+
+        Handles two patterns:
+        - Direct call: identifier(args) -> selector has argument_part
+        - Method call: identifier.method(args) -> first selector has
+          .method accessor, next selector has argument_part
+        """
+        if idx + 1 >= len(siblings):
+            return None
+        next_sib = siblings[idx + 1]
+        if next_sib.type != "selector":
+            return None
+
+        next_children = list(next_sib.children)
+
+        # Direct call: func(args) — selector has argument_part
+        if any(c.type == "argument_part" for c in next_children):
+            return siblings[idx].text.decode("utf-8", errors="replace")
+
+        # Method call: obj.method(args) — first selector has accessor,
+        # next selector has argument_part
+        method_name = None
+        for c in next_children:
+            if c.type == "unconditional_assignable_selector":
+                for sc in c.children:
+                    if sc.type == "identifier":
+                        method_name = sc.text.decode("utf-8", errors="replace")
+        if method_name and idx + 2 < len(siblings):
+            next_next = siblings[idx + 2]
+            if next_next.type == "selector" and any(
+                c.type == "argument_part" for c in next_next.children
+            ):
+                return method_name
 
         return None
